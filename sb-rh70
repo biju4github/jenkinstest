@@ -1,0 +1,555 @@
+#!/bin/bash
+# Script to build, tupdate, fast, package, and run interactive commands in a sandbox
+# Author: Christopher Barton
+
+sigint()
+{
+    end 1 "Killed by user (Ctrl+C)"
+}
+
+alert()
+{
+    notify=$(which notify-send 2>/dev/null)
+    if [ -z "$notify" ]; then
+        notify="echo"
+        $notify $1
+    else
+        fortune=$(which fortune 2>/dev/null)
+        if [ -z "$fortune" ]; then
+            $notify "$1"
+        else
+            $notify "$1" "$(fortune)"
+        fi
+    fi
+}
+
+end()
+{
+    cleanup
+    if [ -z "$2" ]; then
+        alert "The End"
+    else
+        alert "$2"
+    fi
+
+    exit $1
+}
+
+cleanup()
+{
+    #clean up
+    if [ "$(mount | grep $sandbox/proc | wc -l)" == "1" ]; then
+        sudo umount $sandbox/proc
+    fi
+
+    case $command in
+        run)
+            # original
+            #kill="ddd SysMgrd mysql omniNames CDSd patum patum.linux lopes httpd java \"io_*\""
+            kill="ddd SysMgrd mysql omniNames CDSd patum.linux lopes httpd \"io_*\""
+            for proc in $kill; do
+                pids=$(ps -ef | grep $proc | grep -v grep | awk '{print $2;}')
+                for pid in $pids; do
+                    echo "Stopping $proc($pid)"
+                    kill -9 $pid
+                done
+            done
+        ;;
+    esac
+
+    rm -f $sandbox$script $sandbox/tmp/success
+    if [ -d "$sandbox/$mntdir" ]; then
+        if [ "$(mount | grep $sandbox$mntdir | wc -l)" == "1" ]; then
+            sudo umount $sandbox$mntdir
+
+            # try again after 1 second
+            if [ $? -ne 0 ]; then
+                sleep 1
+                sudo umount $sandbox$mntdir
+            fi
+        fi
+
+        if [ $? -eq 0 -a -d $sandbox/$mntdir ]; then
+            rmdir $sandbox/$mntdir
+        fi
+    fi
+}
+
+getwksroot()
+{
+    curr=$PWD
+    try=1
+    while [[ (! -e "$curr/gen2press/work") && (! -e "$curr/digitalpress/work") ]]; do
+        # remove a directory
+        curr=$(echo $curr | sed 's/\/[^\/]*$//')
+
+        if [ -z "$curr" -o "$curr" == "." ]; then
+            # now try with call path
+            if [ $try -ne 0 ]; then
+                curr=$0
+                try=0
+            else
+                echo ""
+                return 1
+        fi
+        fi
+    done
+
+    echo $curr
+    return 0
+}
+
+helpexit()
+{
+cat <<EOF
+$(basename $0) [command] {command args}
+    command
+        Command to run inside the sandbox. This can be:
+            build, update, pack, fast, run, shell, or gdb
+
+    Switches for build, update, and pack:
+    -p [platform] -- can be g2 (default for g2), g25, 1x (default for g1), mb, g2-rd, g25-rd, g25-cdr
+    -t [target]   -- can be rh(default), arm, cortex, cesar, any others from setup
+    -s [sandbox]  -- can be rh54, rh62(default), rh70
+    -v            -- Verbose (build only)
+    -r [release]  -- Specify release number in the format {NAME}.{MAJOR.MINOR}.{NUMBER} 
+
+    Switches for run:
+    -c [configuration] -- can be any valid configuration (ex: 5x5F, 10x10_MICR, etc); defaults to 10x10
+    -i [isd version]   -- defaults to BP01_XP
+    -g [graph]         -- defaults to servermgr.xml for g1 and hostmgr.xml for g2
+    -l [logging]       -- Specifies any extra logging needed (ex: Tofxformer40)
+
+    Examples:
+        Build
+            build cortex targets 'ei' and 'link':
+            $ sb build -t cortex ei link
+
+            build rh targets 'clean all':
+            $ sb build clean all
+
+            builds arm (or cortex if on gen2) target 'hal_lowlevel':
+            $ sb build -t arm hal_lowlevel 
+
+            build rh target 'all':
+            $ sb build 
+            OR
+            $ sb
+
+        Tupdate
+            update pepepress with the default resources used (1x for gen1 and g2 for gen2):
+            $ sb update pepepress
+
+            update 10.3.45.123 with mobius resources configured:
+            $ sb update -p mb 10.3.45.123
+
+        Package
+            create an RPM with the default resources used:
+            $ sb pack
+
+            create an RPM for mobius on gen1:
+            $ sb pack -p mb
+
+        Fast (only useful for gen2)
+            List all the tests possible:
+            $ sb fast list all
+
+            Run the commit tests on backpack.dhcp.sdd.hp.com:
+            $ sb fast run commit -t printer=backpack.dhcp.sdd.hp.com
+
+        Run
+            Run host using defaults (10x10, BP01_XP, servermgr.xml/hostmgr.xml):
+            $ sb run
+
+            Run host using a different configuration:
+            $ sb run -c 5x5F
+
+        Shell
+            Run an interactive shell starting at the work directory:
+            $ sb shell
+
+        GDB
+            Start patum.linux with gdb
+            $ sb gdb
+EOF
+
+    end 1
+}
+
+### Start of execution
+verbose=no
+rh=rh62
+sandbox=$RH62_SANDBOX_PATH
+
+# Trap SIGINT (ctrl-c).  But set some safe values first so we don't remove
+# unwanted directories/files
+script=/tmp/dummyscriptlocation
+mntdir=/tmp/dummymntdirlocation
+trap sigint SIGINT
+
+# get the initial command
+command=$1
+if [ -z "$command" ]; then
+    command="build"
+else
+    shift
+fi
+
+# exit early if just help
+if [ "$command" == "help" ]; then
+    helpexit
+fi
+
+# get the root of the workspace
+wksroot=$(getwksroot)
+if [ ! -d "$wksroot" ]; then
+    end 1 "You must be in the workspace to perform '$command'." 
+fi
+
+# make sure 'svn' works
+info=$(svn info $wksroot)
+if [ $? -ne 0 ]; then
+    end 1 "Looks like an issue with subversion. Please correct and try again."
+fi
+
+# setup variables based on gen1 vs. gen2
+mntdir=$wksroot
+target=rh
+defaultcesar=cesar-custom-opt
+is_gen2=$(echo $info | grep -e "Gen2" -e "g2" | wc -l)
+
+if [ $is_gen2 -eq 1 ]; then # this is a gen2/gen25 branch
+    workdir=gen2press/work
+    platform=g2
+    defaultarm=cortex-threadx-opt
+    defaultgraph=hostmgr.xml
+else
+    workdir=digitalpress/work
+    platform=1x
+    defaultarm=arm-threadx-opt
+    defaultgraph=servermgr.xml
+fi
+
+# process arguments
+case "$command" in
+    fast)
+        OPTERR=1
+        while getopts "c:i:g:l:p:s:" ARG
+        do
+            case $ARG in
+                p)
+                    platform=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                s)
+                    rh=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                ?)  helpexit;;
+            esac
+        done
+    ;;
+    run)
+        OPTERR=1
+        while getopts "c:i:g:l:p:s:" ARG
+        do
+            case $ARG in
+                c)
+                    conf=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                i)
+                    isd=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                g)
+                    graph=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                l)
+                    logging=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                p)
+                    platform=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                s)
+                    rh=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                ?)  helpexit;;
+            esac
+        done
+    ;;
+    *)
+        OPTERR=1
+        while getopts "t:p:s:r:v:" ARG
+        do
+            case $ARG in
+                t) 
+                    target=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                p)
+                    platform=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                s)
+                    rh=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                r)
+                    rel=$OPTARG
+                    shift 2
+                    OPTIND=1;;
+                v)
+                    verbose=yes
+                    shift;;
+                ?)  helpexit;;
+            esac
+        done
+    ;;
+esac
+
+sbox=$rh
+
+case "$rh" in
+    rh54)
+        kernel=
+        defaultrh=rh5-x86_64-opt
+        sandbox=$RH54_SANDBOX_PATH;;
+    rh62)
+        kernel=2.6.32-220.el6.x86_64
+        defaultrh=rh62-x86_64-opt
+        sandbox=$RH62_SANDBOX_PATH;;
+    rh70)
+        kernel=3.10.0-123.el7.x86_64
+        defaultrh=rh70-x86_64-opt
+        sandbox=$RH70_SANDBOX_PATH;;
+    rh70-32bit)
+        kernel=3.10.0-123.el7.x86_64
+        defaultrh=rh70-x86_64-opt
+        sandbox=$RH70_32BIT_SANDBOX_PATH;;
+esac
+
+# sanity checks
+if [ ! -d "$sandbox" ]; then
+    end 1 "The sandbox path was not defined or is not a valid directory.
+           Please specify RH[54|62|70]_SANDBOX_PATH environment variable."
+fi
+
+if [ -d "$sandbox$mntdir" ]; then
+    end 1 "Workspace is already setup. Check that you aren't already in the sandbox."
+fi
+
+case "$target" in
+    rh) target=$defaultrh;;
+    cortex) target=$defaultarm;;
+    arm) target=$defaultarm;;
+    cesar) target=$defaultcesar;;
+esac
+
+# Separating platform and mplatform, eg:g2-rd
+if [[ $platform == *"-"* ]]; then
+     mplatform=$(echo $platform | cut -f1 -d-)
+     platform=$(echo $platform | cut -f2 -d-)
+else
+     mplatform=$platform
+fi
+
+if [ "$mplatform" == "g25" ]; then
+    workdir=gen25press/work
+fi
+
+# setup a script to run a command sequence in the sandbox
+script=/tmp/run.sh.$(date +%s)
+echo "#!/bin/bash" >$sandbox$script
+echo "cd /$mntdir/$workdir" >>$sandbox$script
+
+# default of 1x/mb needs to be dp for setup
+if [ "$platform" == "1x" -o "$platform" == "mb" ]; then
+    mplatform=dp
+fi
+
+# the next steps are different per command
+case "$command" in
+    build)
+        makeargs="$1 $2 $3 $4 $5 $6 $7"
+        makeargs=$(echo $makeargs | sed 's/\(^[ ]*\) +/_1/')
+        if [ -z "$makeargs" ]; then
+            makeargs="all"
+        fi
+
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo "export MK_VERBOSE=$verbose" >>$sandbox$script
+        echo ". ./setup $target $mplatform" >>$sandbox$script
+        echo "make $makeargs" >>$sandbox$script
+    ;;
+
+    update)
+        machine=$1
+        if [ -z "$machine" ]; then
+            end 1 "You must provide a machine IP or DN to update."
+        fi
+
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo ". ./setup $target $mplatform" >>$sandbox$script
+        echo "./configure -p $platform" >>$sandbox$script
+        echo "export USER_OVERRIDE=$(id -nu)" >>$sandbox$script
+        echo "ping -c2 $machine >/dev/null 2>&1" >>$sandbox$script
+        echo "if [ \$? -eq 0 ]; then" >>$sandbox$script
+        echo "  tupdate -s target $machine" >>$sandbox$script
+        echo "else" >>$sandbox$script
+        echo "  press tupdate $machine" >>$sandbox$script
+        echo "fi" >>$sandbox$script
+    ;;
+
+    pack)
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo ". ./setup $target $mplatform" >>$sandbox$script
+
+        if [ -n "$rel" ]; then
+           echo "./configure -p $platform -r $rel" >>$sandbox$script
+           build=$(echo $rel | sed "s/.*\.\([0-9]*\)/\1/")
+           majmin=$(echo $rel | sed "s/[^\.]*\.\([0-9]*\.[0-9]*\).*/\1/")
+        else
+           echo "./configure -p $platform" >>$sandbox$script
+        fi
+ 
+        resources=$platform
+        
+        echo "build=${build}" >> $sandbox$script
+        echo "majmin=$majmin" >>$sandbox$script
+        echo "resources=$resources" >>$sandbox$script
+        echo "sbox=$sbox" >>$sandbox$script
+
+        if [ "$platform" == "tz" ]; then
+           spec=$wksroot/tzabar/tz/work/rpm.spec
+        elif [ "$mplatform" == "g2" ]; then
+           spec=$wksroot/gen2press/g2/work/rpm.spec
+        elif [ "$mplatform" == "g25" ]; then
+           spec=$wksroot/gen25press/g25/work/rpm.spec
+        else
+           spec=$wksroot/digitalpress/dp/work/rpm.spec
+        fi 
+
+        # svn version 
+        if [ "$SVN" == "" ]; then
+           SVN=$(which svn)
+           svnver=$($SVN info $wksroot | grep "Revision" | sed 's/[^0-9]*\([0-9]*\)/\1/')
+        fi
+
+        # create a backup of rpm.spec
+        cp -p $spec $spec.tmp        
+
+        echo "spec=$spec" >>$sandbox$script
+        tmpspec=$spec.mod
+        echo "tmpspec=$tmpspec" >>$sandbox$script
+        
+        if [ -n "$rel" ]; then
+          echo "cat $spec | sed \"/define release/s/release_num/${build}\.${resources}\.${sbox//-/_}/\" | \
+            sed \"/define version/s/unreleased/${majmin}/\" > $tmpspec" >>$sandbox$script
+        else
+          unrel=$svnver.$resources.${sbox//-/_}
+          echo "cat $spec | sed \"/define release/s/release_num/$unrel/\" > $tmpspec" >>$sandbox$script
+        fi
+        echo "mv $tmpspec $spec" >>$sandbox$script
+        echo "make TAR RPM" >>$sandbox$script
+        
+        # restore the backup
+        echo "mv -f $spec.tmp $spec" >>$sandbox$script
+    ;;
+
+    fast)
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo ". ./setup $target $platform" >>$sandbox$script
+        echo "fast $1 $2 $3 $4 $5 $6 $7 $8 $9" >>$sandbox$script
+    ;;
+
+    run)
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo ". ./setup $target $mplatform" >>$sandbox$script
+        echo "./configure -p $platform" >>$sandbox$script
+
+        # if not defined use defaults
+        if [ -z "$isd" ]; then
+            isd="BP01_XP"
+        fi
+        if [ -z "$conf" ]; then
+            conf="10x10"
+        fi
+        if [ -z "$graph" ]; then
+            graph=$defaultgraph
+        fi
+
+        cat >>$sandbox$script <<EOF
+rm -f /usr/tmp/omninames*
+export LOGGING_SET="$logging"
+cd \$PATUM_TARGET_ROOT/home/bin
+./start --parallel=15 -b=empty -f=sequoia$conf --commands=commands${conf}.tcl --pecId=a --isdVersion=$isd $graph 2>&1 | tee /root/press.log
+EOF
+    ;;
+
+    shell)
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo "/bin/bash" >>$sandbox$script
+    ;;
+
+    gdb)
+        echo "export TARGET_KERNEL=$kernel" >>$sandbox$script
+        echo ". ./setup $target $mplatform" >>$sandbox$script
+    echo "gdb ${@:-\$PATUM_TARGET_ROOT/home/bin/patum.linux}" >>$sandbox$script
+    ;;
+
+esac
+chmod +rx $sandbox$script
+
+# mount workspace inside the sandbox
+mkdir -p $sandbox$mntdir
+if [ $? -ne 0 ]; then
+    end 1 "Cannot setup mount into sandbox. Check permissions."
+fi
+
+sudo mount --bind $wksroot $sandbox$mntdir
+if [ $? -ne 0 ]; then
+    end 1 "Cannot mount onto sandbox. Check permissions."
+fi
+
+# mount /proc
+sudo mount --bind /proc $sandbox/proc
+if [ $? -ne 0 ]; then
+    end 1 "Cannot mount /proc into the sandbox."
+fi
+
+# 1-time setup
+if [ -e "$sandbox/bin/ping" -a "$(ls -l $sandbox/bin/ping | awk '{print $3;}')" != "root" ]; then
+    # fix permissions
+    sudo chown root:root $sandbox/bin/ping $sandbox/usr/bin/rsh $sandbox/usr/bin/rcp $sandbox/usr/bin/rlogin $sandbox/usr/bin/ssh
+    sudo chmod +s $sandbox/bin/ping $sandbox/usr/bin/rsh $sandbox/usr/bin/rcp $sandbox/usr/bin/rlogin $sandbox/usr/bin/ssh
+
+    # change atlas to match user id
+    uid=$(id -u)
+    cat $sandbox/etc/passwd | awk -F":" "{if(\$1 == \"atlas\") print(\$1 \":\" \$2 \":\" $uid \":\" \$4 \":\" \$5 \":\" \$6); else print \$0;}" >$sandbox/tmp/passwd.new
+    mv $sandbox/tmp/passwd.new $sandbox/etc/passwd
+
+    # allow networking
+    cp /etc/resolv.conf $sandbox/etc
+    if [ $? -ne 0 ]; then
+        end 1 "Cannot copy resolve.conf into sandbox. Check permissions."
+    fi
+
+    # change timezone to Pacific
+    sudo rm /etc/localtime
+    sudo ln -s /usr/share/zoneinfo/US/Pacific /etc/localtime
+fi
+
+# run the script
+result=0
+sudo /usr/sbin/chroot $sandbox su -l -s/bin/bash - atlas --session-command $script && touch $sandbox/tmp/success
+if [ ! -e $sandbox/tmp/success ]; then
+    result=1
+fi
+
+end $result
+
